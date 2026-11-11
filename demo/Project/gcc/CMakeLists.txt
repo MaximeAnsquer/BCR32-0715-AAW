@@ -25,12 +25,9 @@ set(SOURCES
 
     ${DEMO}/App/main.c
     ${DEMO}/App/input.c
-    ${DEMO}/App/sync_loop.c
+    ${DEMO}/App/seq.c
     ${DEMO}/App/cv_out.c
-    ${DEMO}/App/midi_thru.c
     ${DEMO}/App/activity_led.c
-    ${DEMO}/App/flash_test.c
-    ${DEMO}/App/iflash_test.c
     ${DEMO}/App/boot_jump.c
     ${DEMO}/App/sysex.c
 

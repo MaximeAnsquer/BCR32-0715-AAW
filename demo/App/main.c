@@ -1,28 +1,26 @@
 /*
- * main.c - BCR32 bare-metal demo (no RTOS)
+ * main.c - BCR32 test firmware: minimal 8 step sequencer with "shift" step lengths
  *
- * Image at 0x08010000, started by the BCR32 bootloader; SystemInit: 120 MHz PLL from
- * the 8 MHz HXTAL.
- * Demo: SysTick 1 ms tick, one LED at a time walks once over every HT16K33 output
- * (chip, RAM byte, bit), then all LEDs stay off.
- * Outputs without a fitted LED show as dark steps.
- * OLED (SSD1306 128x32 on SPI1) shows "BCR32" centered at power up, then the last
- * button / encoder event (input.c event queue, see OnInputEvent).
- * USB MIDI (GD32 USBFS device stack, ports "BCR-32 CTRL"/"BCR-32 ZAQ"):
- * every packet received from the host is sent back unchanged (loopback).
- * SYNC OUT -> SYNC IN loopback (cable plugged between them, sync_loop.c): result every
- * second, OLED "SYNC OK" / "SYNC FAIL" while the SELECT button is held.
- * Knobs 1..4 set CV1..4 (cv_out.c, 0..10 V in 0.1 V steps), value bottom right of the OLED.
- * BTN1..16 set GATE1..4 to 0 / 5 / 10 V (GateFromButton), "GATEx:yV" bottom right of the OLED.
- * DIN MIDI: every byte from MIDI IN goes out unchanged on MIDI OUT A and B (midi_thru.c).
- * Activity LEDs flash on traffic: MIDI IN / OUT A / OUT B with the DIN thru, USB with
- * the USB MIDI loopback (activity_led.c).
- * External SPI flash (W25X40CL, DMA, bsp_flash.c): self test on sector 127 at power up
- * (flash_test.c).
- * Internal flash (bsp_iflash.c, sector 5 only): self test at power up (iflash_test.c).
- * USB SysEx (sysex.c): 0x74 mode query answered, 0x77 starts the bootloader.
- * T1 + T2 + T3 + T4 (BTN18..21) held together: start the bootloader (boot_jump.c) for a
- * firmware update with tools/update/windows/update.exe.
+ * Built on the bare-metal demo (no RTOS, image at 0x08010000 started by the BCR32
+ * bootloader, 1 ms SysTick main loop). Purpose: try a step length that pushes the
+ * following steps later instead of overlapping them (seq.c).
+ *
+ * Controls
+ *   Knobs 1..8      pitch of step 1..8 (semitones)
+ *   Knobs 9..16     length of step 1..8 (1..8 sixteenth notes)
+ *   SELECT button   mode: SHIFT (steps back to back) / OVERLAP (steps on the 1/16 grid)
+ *   SELECT encoder  tempo
+ *   T1              play / stop (plays at power up)
+ *   T1+T2+T3+T4     bootloader (firmware update), as the demo; SysEx 0x77 as well
+ *
+ * Outputs
+ *   MIDI notes, channel 1: MIDI OUT A, MIDI OUT B, USB port 1 ("BCR-32 CTRL")
+ *   CV1 1 V / octave (0 V = note 36), GATE1 5 V while a note sounds
+ *
+ * OLED: mode, tempo and the last edit on the first line; below it the pattern as a
+ * piano roll (x = time over one pattern, y = pitch) with the playhead.
+ *
+ * Not used here (demo only): encoder ring and key LEDs, SYNC, MIDI IN, flash tests.
  */
 #include <stdio.h>
 #include <string.h>
@@ -30,229 +28,281 @@
 #include "gd32f4xx.h"
 
 #include "input.h"
-#include "sync_loop.h"
+#include "seq.h"
 #include "cv_out.h"
-#include "midi_thru.h"
 #include "activity_led.h"
-#include "flash_test.h"
-#include "iflash_test.h"
 #include "boot_jump.h"
 #include "sysex.h"
 
 #include "bsp_cv.h"
 #include "bsp_gpio.h"
 #include "bsp_led.h"
-#include "bsp_delay.h"
+#include "bsp_midi_uart.h"
 #include "bsp_spi1.h"
 #include "bsp_usb.h"
 #include "ssd1306.h"
 #include "usbd_midi.h"
 
 #define LED_BRIGHTNESS      0x0FU   /* HT16K33 duty 0..15 */
-#define STEP_PERIOD         100U    /* ms per LED */
-#define LED_WRITE_GAP_US    50U     /* as bsp_led.c: gap between two HT16K33 writes */
+#define MIDI_CHANNEL        0U      /* channel 1 */
+#define MIDI_VELOCITY       100U
+#define OLED_PERIOD_MS      40U
+#define ROLL_TOP            10U     /* piano roll area: y ROLL_TOP..SSD1306_HEIGHT-1 */
+#define BAR_HEIGHT          3U
+#define QUEUE_SIZE          256U    /* power of two, bytes */
+#define CHUNK_MAX           64U
+
+#define KNOB_PITCH_FIRST    1U
+#define KNOB_LEN_FIRST      (KNOB_PITCH_FIRST + SEQ_STEPS)
+
+typedef struct
+{
+    uint8_t  data[QUEUE_SIZE];
+    uint32_t head, tail;
+} Queue_t;
 
 static volatile uint32_t s_tick_ms;
+
+static Queue_t s_din;           /* MIDI bytes for OUT A and OUT B */
+static Queue_t s_usb;           /* USB-MIDI event packets, 4 bytes each */
+static uint32_t s_gate_notes;   /* notes sounding now */
+static char s_edit[12];         /* last edit, shown top right */
+static uint8_t s_oled_dirty = 1U;
 
 void SysTick_Handler(void)
 {
     s_tick_ms++;
 }
 
-static void OledShowSplash(void)
+/* all or nothing; a full queue drops the message */
+static void QueuePut(Queue_t *q, const uint8_t *data, uint32_t len)
 {
-    static char text[] = "BCR32";
-    const uint8_t w = (uint8_t)((sizeof(text) - 1U) * Font_16x26.FontWidth);
+    uint32_t i;
 
-    ssd1306_Fill(Black);
-    ssd1306_SetCursor((uint8_t)((SSD1306_WIDTH - w) / 2U),
-                      (uint8_t)((SSD1306_HEIGHT - Font_16x26.FontHeight) / 2U));
-    (void)ssd1306_WriteString(text, Font_16x26, White);
-    ssd1306_UpdateScreen();
-}
-
-static SyncLoopResult_t s_sync_last;        /* last 1 s SYNC loopback result */
-static uint8_t s_sync_valid;                /* s_sync_last holds a result */
-static uint8_t s_sync_view;                 /* SELECT held: OLED shows the SYNC state */
-
-static uint8_t SyncOk(const SyncLoopResult_t *r)
-{
-    return ((r->tip.ok != 0U) && (r->ring.ok != 0U)) ? 1U : 0U;
-}
-
-/* "SYNC OK" / "SYNC FAIL", below it the input/output edge counts of tip and ring */
-static void OledShowSync(void)
-{
-    char line[24];
-
-    ssd1306_Fill(Black);
-    ssd1306_SetCursor(0U, 0U);
-    if (s_sync_valid == 0U)
-    {
-        (void)ssd1306_WriteString("SYNC ...", Font_11x18, White);   /* first second */
-    }
-    else
-    {
-        (void)ssd1306_WriteString((SyncOk(&s_sync_last) != 0U) ? "SYNC OK" : "SYNC FAIL", Font_11x18, White);
-        (void)snprintf(line, sizeof(line), "T%u/%u R%u/%u",
-                       (unsigned int)s_sync_last.tip.in_edges, (unsigned int)s_sync_last.tip.out_edges,
-                       (unsigned int)s_sync_last.ring.in_edges, (unsigned int)s_sync_last.ring.out_edges);
-        ssd1306_SetCursor(0U, (uint8_t)(SSD1306_HEIGHT - Font_7x10.FontHeight));
-        (void)ssd1306_WriteString(line, Font_7x10, White);
-    }
-    ssd1306_UpdateScreen();
-}
-
-/* SYNC loopback result (1 s window): kept; on the OLED only while SELECT is held */
-static void OnSyncResult(const SyncLoopResult_t *r)
-{
-    s_sync_last = *r;
-    s_sync_valid = 1U;
-    if (s_sync_view != 0U)
-    {
-        OledShowSync();
-    }
-}
-
-/* BTN1..16 in groups of 4, one group per gate: 1st = 0 V, 2nd = 5 V, 3rd = 10 V,
- * 4th unused (BTN1-3 GATE1, BTN5-7 GATE2, BTN9-11 GATE3, BTN13-15 GATE4); level latched.
- * Writes "GATEx:yV" to label and returns 1 for a gate button, else returns 0. */
-static int GateFromButton(uint32_t id, char *label, uint32_t size)
-{
-    static const BspGateLevel_t level[3] = {BSP_GATE_0V, BSP_GATE_5V, BSP_GATE_10V};
-    static const char *const name[3] = {"0V", "5V", "10V"};
-    uint32_t gate, pos;
-
-    if ((id < 1U) || (id > (BSP_CV_NUM_CHANNELS * 4U)))
-    {
-        return 0;
-    }
-    gate = (id - 1U) / 4U;
-    pos  = (id - 1U) % 4U;
-    if (pos >= 3U)
-    {
-        return 0;
-    }
-    BspGate_Set(gate, level[pos]);
-    (void)snprintf(label, size, "GATE%u:%s", (unsigned int)(gate + 1U), name[pos]);
-    return 1;
-}
-
-/* Input event handler: the OLED shows the last event
- *   SELECT button: SYNC state while held (OledShowSync), blank screen on release
- *   button:  "BTNn" centered, large font (other releases change nothing)
- *   encoder: "ENCODER +x" / "ENCODER -x" (detents in one 20 ms detection), below it
- *            which encoder ("KNOB n" or "SELECT") */
-static void OnInputEvent(const InputEvent_t *ev)
-{
-    char line[16];
-
-    if (ev->id == INPUT_BTN_SELECT)
-    {
-        if (ev->type == INPUT_EV_BUTTON)
-        {
-            s_sync_view = 1U;
-            OledShowSync();
-            return;
-        }
-        if (ev->type == INPUT_EV_BUTTON_UP)
-        {
-            s_sync_view = 0U;
-            ssd1306_Fill(Black);
-            ssd1306_UpdateScreen();
-            return;
-        }
-    }
-    if (ev->type == INPUT_EV_BUTTON_UP)
+    if ((QUEUE_SIZE - (q->head - q->tail)) < len)
     {
         return;
     }
-
-    ssd1306_Fill(Black);
-    if (ev->type == INPUT_EV_BUTTON)
+    for (i = 0U; i < len; i++)
     {
-        char gate[12];
-        const uint32_t n = (uint32_t)snprintf(line, sizeof(line), "BTN%u", ev->id);
-
-        if (GateFromButton(ev->id, gate, sizeof(gate)) != 0)
-        {
-            /* gate button: "BTNn" top left, "GATEx:yV" bottom right (layout as the knobs) */
-            const uint8_t w = (uint8_t)(strlen(gate) * Font_7x10.FontWidth);
-
-            ssd1306_SetCursor(0U, 0U);
-            (void)ssd1306_WriteString(line, Font_11x18, White);
-            ssd1306_SetCursor((uint8_t)(SSD1306_WIDTH - w), (uint8_t)(SSD1306_HEIGHT - Font_7x10.FontHeight));
-            (void)ssd1306_WriteString(gate, Font_7x10, White);
-        }
-        else
-        {
-            const uint8_t w = (uint8_t)(n * Font_16x26.FontWidth);
-
-            ssd1306_SetCursor((uint8_t)((SSD1306_WIDTH - w) / 2U),
-                              (uint8_t)((SSD1306_HEIGHT - Font_16x26.FontHeight) / 2U));
-            (void)ssd1306_WriteString(line, Font_16x26, White);
-        }
+        q->data[q->head & (QUEUE_SIZE - 1U)] = data[i];
+        q->head++;
     }
-    else
-    {
-        (void)snprintf(line, sizeof(line), "ENCODER %+d", ev->delta);
-        ssd1306_SetCursor(0U, 0U);
-        (void)ssd1306_WriteString(line, Font_11x18, White);
-
-        if (ev->id == INPUT_ENC_SELECT)
-        {
-            (void)snprintf(line, sizeof(line), "SELECT");
-        }
-        else
-        {
-            (void)snprintf(line, sizeof(line), "KNOB %u", ev->id);
-        }
-        ssd1306_SetCursor(0U, (uint8_t)(SSD1306_HEIGHT - Font_7x10.FontHeight));
-        (void)ssd1306_WriteString(line, Font_7x10, White);
-
-        /* knobs 1..4 set CV1..4, the value bottom right */
-        if ((ev->id >= 1U) && (ev->id <= CV_OUT_NUM))
-        {
-            const uint32_t dv = CvOut_Add(ev->id - 1U, ev->delta);
-            const uint8_t w = (uint8_t)((uint32_t)snprintf(line, sizeof(line), "CV%u:%u.%uV",
-                                                           ev->id, (unsigned int)(dv / 10U),
-                                                           (unsigned int)(dv % 10U)) * Font_7x10.FontWidth);
-
-            ssd1306_SetCursor((uint8_t)(SSD1306_WIDTH - w), (uint8_t)(SSD1306_HEIGHT - Font_7x10.FontHeight));
-            (void)ssd1306_WriteString(line, Font_7x10, White);
-        }
-    }
-    ssd1306_UpdateScreen();
 }
 
-/* Loopback: host -> device packets go straight back, followed by the SysEx replies
- * (sysex.c); data stays in the receive buffer (host NAKed when full) while the
- * previous IN transfer is pending */
-static void UsbMidiLoopback(void)
+static uint32_t QueueGet(Queue_t *q, uint8_t *data, uint32_t max)
 {
-    static uint8_t buf[64 + 16];
+    uint32_t n = 0U;
+
+    while ((n < max) && (q->tail != q->head))
+    {
+        data[n++] = q->data[q->tail & (QUEUE_SIZE - 1U)];
+        q->tail++;
+    }
+    return n;
+}
+
+static void MidiNote(uint8_t status, uint8_t note, uint8_t velocity)
+{
+    const uint8_t din[3] = {(uint8_t)(status | MIDI_CHANNEL), note, velocity};
+    const uint8_t usb[4] = {(uint8_t)(status >> 4), din[0], note, velocity};    /* cable 0 */
+
+    QueuePut(&s_din, din, sizeof(din));
+    if (IsUsbConnected() != 0U)
+    {
+        QueuePut(&s_usb, usb, sizeof(usb));
+    }
+}
+
+/* seq.c outputs: MIDI, CV1 follows the newest note, GATE1 high while any note sounds */
+void SeqOut_NoteOn(uint8_t note)
+{
+    MidiNote(0x90U, note, MIDI_VELOCITY);
+    CvOut_SetMv(0U, (((uint32_t)note - SEQ_PITCH_MIN) * 1000U) / 12U);
+    s_gate_notes++;
+    BspGate_Set(0U, BSP_GATE_5V);
+}
+
+void SeqOut_NoteOff(uint8_t note)
+{
+    MidiNote(0x80U, note, 0U);
+    if ((s_gate_notes != 0U) && (--s_gate_notes == 0U))
+    {
+        BspGate_Set(0U, BSP_GATE_0V);
+    }
+}
+
+/* Both DIN ports get the same bytes: send only when both are idle */
+static void DinPoll(void)
+{
+    uint8_t buf[CHUNK_MAX];
     uint32_t n;
 
-    if ((IsUsbConnected() == 0U) || (UsbMidiTxBusy() != 0U))
+    if ((BspMidiUart_IsTxBusy(BSP_MIDI_PORT_A) != 0) || (BspMidiUart_IsTxBusy(BSP_MIDI_PORT_B) != 0))
     {
         return;
     }
-    n = UsbMidiRxRead(buf, 64U);
+    n = QueueGet(&s_din, buf, sizeof(buf));
     if (n == 0U)
     {
         return;
     }
-    Sysex_UsbRx(buf, n);
-    n += Sysex_UsbTx(&buf[n], sizeof(buf) - n);
-    USBTxNBytes(buf, n);
-    ActivityLed_Trigger(ACTIVITY_LED_USB, s_tick_ms);
+    (void)BspMidiUart_Send(BSP_MIDI_PORT_A, buf, n);
+    (void)BspMidiUart_Send(BSP_MIDI_PORT_B, buf, n);
+    ActivityLed_Trigger(ACTIVITY_LED_MIDI_A, s_tick_ms);
+    ActivityLed_Trigger(ACTIVITY_LED_MIDI_B, s_tick_ms);
+}
+
+/* Host packets go to the SysEx parser (mode query, bootloader request); its replies and
+ * the queued notes go to the host */
+static void UsbPoll(void)
+{
+    static uint8_t buf[CHUNK_MAX + 16U];
+    uint32_t n;
+
+    if (IsUsbConnected() == 0U)
+    {
+        s_usb.tail = s_usb.head;    /* no host: nothing kept for later */
+        return;
+    }
+    n = UsbMidiRxRead(buf, CHUNK_MAX);
+    if (n != 0U)
+    {
+        Sysex_UsbRx(buf, n);
+    }
+    if (UsbMidiTxBusy() != 0U)
+    {
+        return;
+    }
+    n = Sysex_UsbTx(buf, 16U);
+    n += QueueGet(&s_usb, &buf[n], CHUNK_MAX);
+    if (n != 0U)
+    {
+        USBTxNBytes(buf, n);
+        ActivityLed_Trigger(ACTIVITY_LED_USB, s_tick_ms);
+    }
+}
+
+static void NoteName(uint8_t note, char *text, uint32_t size)
+{
+    static const char *const name[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+
+    (void)snprintf(text, size, "%s%d", name[note % 12U], ((int)note / 12) - 1);
+}
+
+/* One bar of the piano roll, from tick t0 for len ticks; wraps at the end of the pattern */
+static void DrawBar(uint32_t t0, uint32_t len, uint32_t total, uint8_t y)
+{
+    uint32_t t1 = t0 + len;
+
+    if (t1 > total)
+    {
+        DrawBar(0U, t1 - total, total, y);
+        t1 = total;
+    }
+    {
+        const uint32_t x0 = (t0 * SSD1306_WIDTH) / total;
+        uint32_t x1 = (t1 * SSD1306_WIDTH) / total;
+
+        x1 = (x1 > (x0 + 1U)) ? (x1 - 1U) : x0;
+        ssd1306_FillRectangle((uint8_t)x0, y, (uint8_t)x1, (uint8_t)(y + BAR_HEIGHT - 1U), White);
+    }
+}
+
+static void OledDraw(void)
+{
+    char line[24];
+    const uint32_t total = Seq_GetTotalTicks();
+    const uint32_t span_y = (SSD1306_HEIGHT - ROLL_TOP) - BAR_HEIGHT;
+    uint32_t i, lo = SEQ_PITCH_MAX, hi = SEQ_PITCH_MIN, x;
+
+    ssd1306_Fill(Black);
+
+    (void)snprintf(line, sizeof(line), "%s %3u %c", (Seq_GetMode() == SEQ_MODE_SHIFT) ? "SHIFT" : "OVERL",
+                   (unsigned int)Seq_GetTempo(), (Seq_IsPlaying() != 0U) ? '>' : '-');
+    ssd1306_SetCursor(0U, 0U);
+    (void)ssd1306_WriteString(line, Font_6x8, White);
+    ssd1306_SetCursor((uint8_t)(SSD1306_WIDTH - (strlen(s_edit) * Font_6x8.FontWidth)), 0U);
+    (void)ssd1306_WriteString(s_edit, Font_6x8, White);
+
+    for (i = 0U; i < SEQ_STEPS; i++)
+    {
+        const uint32_t p = Seq_GetPitch(i);
+
+        lo = (p < lo) ? p : lo;
+        hi = (p > hi) ? p : hi;
+    }
+    for (i = 0U; i < SEQ_STEPS; i++)
+    {
+        const uint32_t up = (hi > lo) ? (((Seq_GetPitch(i) - lo) * span_y) / (hi - lo)) : (span_y / 2U);
+
+        DrawBar(Seq_GetStartTicks(i), Seq_GetNoteTicks(i), total, (uint8_t)((ROLL_TOP + span_y) - up));
+    }
+
+    if (Seq_IsPlaying() != 0U)
+    {
+        x = ((Seq_GetPosTicks() % total) * SSD1306_WIDTH) / total;
+        ssd1306_Line((uint8_t)x, (uint8_t)ROLL_TOP, (uint8_t)x, (uint8_t)(SSD1306_HEIGHT - 1U), White);
+    }
+    ssd1306_UpdateScreen();
+}
+
+static void OnInputEvent(const InputEvent_t *ev)
+{
+    char name[6];
+
+    if (ev->type == INPUT_EV_BUTTON)
+    {
+        if (ev->id == INPUT_BTN_SELECT)
+        {
+            Seq_SetMode((Seq_GetMode() == SEQ_MODE_SHIFT) ? SEQ_MODE_OVERLAP : SEQ_MODE_SHIFT);
+        }
+        else if (ev->id == INPUT_BTN_T1)
+        {
+            Seq_SetPlaying((Seq_IsPlaying() != 0U) ? 0U : 1U);
+        }
+        else
+        {
+            (void)snprintf(s_edit, sizeof(s_edit), "BTN%u", ev->id);    /* shows the key numbering */
+        }
+        s_oled_dirty = 1U;
+    }
+    else if (ev->type == INPUT_EV_ENCODER)
+    {
+        if (ev->id == INPUT_ENC_SELECT)
+        {
+            (void)Seq_AddTempo(ev->delta);
+            s_edit[0] = '\0';
+        }
+        else if ((ev->id >= KNOB_PITCH_FIRST) && (ev->id < KNOB_LEN_FIRST))
+        {
+            const uint32_t step = ev->id - KNOB_PITCH_FIRST;
+
+            NoteName(Seq_AddPitch(step, ev->delta), name, sizeof(name));
+            (void)snprintf(s_edit, sizeof(s_edit), "%u:%s", (unsigned int)(step + 1U), name);
+        }
+        else if ((ev->id >= KNOB_LEN_FIRST) && (ev->id < (KNOB_LEN_FIRST + SEQ_STEPS)))
+        {
+            const uint32_t step = ev->id - KNOB_LEN_FIRST;
+
+            (void)snprintf(s_edit, sizeof(s_edit), "%u:LEN%u", (unsigned int)(step + 1U),
+                           (unsigned int)Seq_AddLength(step, ev->delta));
+        }
+        else
+        {
+            (void)snprintf(s_edit, sizeof(s_edit), "KNOB%u", ev->id);   /* unused knob: its number */
+        }
+        s_oled_dirty = 1U;
+    }
+    else
+    {
+        /* button release: nothing */
+    }
 }
 
 int main(void)
 {
-    uint32_t last = 0U;
-    uint32_t chip = 0U, addr = 0U, bit = 0U;    /* LED currently lit */
-    uint8_t led_done = 0U;                      /* walk finished, all LEDs off */
+    uint32_t seq_ms, oled_ms = 0U;
 
     /* SystemInit already ran from Reset_Handler; IRQs are still masked (CPSID i) */
     nvic_priority_group_set(NVIC_PRIGROUP_PRE4_SUB0);
@@ -261,27 +311,32 @@ int main(void)
 
     BspClock_Init();
     BspGpio_Init();
-    SyncLoop_Init();
     CvOut_Init();       /* ~1 ms busy wait */
-    MidiThru_Init();
+    BspMidiUart_Init();
     BspSpi1_Init();
     Oled_Init();        /* reset, SSD1306 setup, blank screen */
-    OledShowSplash();
-    FlashTest_Start(s_tick_ms);     /* shares SPI1 with the OLED */
-    IFlashTest_Start(s_tick_ms);
     BspUsb_Init();
     BspLedI2c_Init();
-    (void)BspLed_Init(LED_BRIGHTNESS);
-    (void)BspLed_Write2(g_bsp_led_chips[chip], (uint8_t)addr, (uint8_t)(1U << bit));
+    (void)BspLed_Init(LED_BRIGHTNESS);      /* all LEDs off */
+
+    Seq_Init();
+    Seq_SetPlaying(1U);
+    seq_ms = s_tick_ms;
 
     for (;;)
     {
         InputEvent_t ev;
-        SyncLoopResult_t sync;
+        const uint32_t now = s_tick_ms;
 
-        UsbMidiLoopback();
+        while (seq_ms != now)
+        {
+            seq_ms++;
+            Seq_Tick1ms();
+        }
+        DinPoll();
+        UsbPoll();
 
-        Input_Poll(s_tick_ms);
+        Input_Poll(now);
         while (Input_GetEvent(&ev) != 0)
         {
             OnInputEvent(&ev);
@@ -292,51 +347,19 @@ int main(void)
             ((Input_IsPressed(INPUT_BTN_T1) != 0U) && (Input_IsPressed(INPUT_BTN_T1 + 1U) != 0U) &&
              (Input_IsPressed(INPUT_BTN_T1 + 2U) != 0U) && (Input_IsPressed(INPUT_BTN_T4) != 0U)))
         {
+            Seq_SetPlaying(0U);
             BootJump_Start();
         }
 
-        CvOut_Poll(s_tick_ms);
-        if (MidiThru_Poll() != 0U)
+        CvOut_Poll(now);
+        ActivityLed_Poll(now);
+
+        /* playhead: redraw at 25 Hz while playing, otherwise only after an edit */
+        if (((now - oled_ms) >= OLED_PERIOD_MS) && ((s_oled_dirty != 0U) || (Seq_IsPlaying() != 0U)))
         {
-            ActivityLed_Trigger(ACTIVITY_LED_MIDI_IN, s_tick_ms);
-            ActivityLed_Trigger(ACTIVITY_LED_MIDI_A, s_tick_ms);
-            ActivityLed_Trigger(ACTIVITY_LED_MIDI_B, s_tick_ms);
-        }
-        ActivityLed_Poll(s_tick_ms);
-        FlashTest_Poll(s_tick_ms);
-        IFlashTest_Poll(s_tick_ms);
-
-        if (SyncLoop_Poll(s_tick_ms, &sync) != 0)
-        {
-            OnSyncResult(&sync);
-        }
-
-        if ((led_done == 0U) && ((s_tick_ms - last) >= STEP_PERIOD))
-        {
-            last += STEP_PERIOD;
-
-            /* previous LED off: clear its whole RAM byte */
-            (void)BspLed_Write2(g_bsp_led_chips[chip], (uint8_t)addr, 0x00U);
-            BspDelay_Us(LED_WRITE_GAP_US);
-
-            /* next position: bit -> RAM byte -> chip; one pass only */
-            if (++bit == 8U)
-            {
-                bit = 0U;
-                if (++addr == BSP_LED_RAM_BYTES)
-                {
-                    addr = 0U;
-                    if (++chip == BSP_LED_NUM_CHIPS)
-                    {
-                        led_done = 1U;
-                    }
-                }
-            }
-
-            if (led_done == 0U)
-            {
-                (void)BspLed_Write2(g_bsp_led_chips[chip], (uint8_t)addr, (uint8_t)(1U << bit));
-            }
+            oled_ms = now;
+            s_oled_dirty = 0U;
+            OledDraw();
         }
     }
 }
